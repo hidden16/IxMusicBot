@@ -64,7 +64,7 @@ Set `LANGUAGE=en` or `LANGUAGE=bg` in `.env` to force one language.
 - FFmpeg (plays the audio). If it is not in PATH, set the full path in `.env` → `FFMPEG_PATH`.
 
 You don't have to install them by hand: `run.bat` checks all three on every start and, if one is missing,
-offers to install it with `winget` (it asks before each install). Manual install:
+offers to install it with `winget` (it asks before each install). See [What gets installed](#what-gets-installed). Manual install:
 ```
 winget install Python.Python.3.13
 winget install OpenJS.NodeJS.LTS
@@ -111,6 +111,28 @@ Permissions: View Channels, Send Messages, Embed Links, Connect, Speak.
 ### 6. Usage
 Join a voice channel and type `/play` with a song name or a YouTube / YouTube Music link.
 The bot only runs while `bot.py` is running on your machine.
+
+## What gets installed
+`run.bat` never installs anything silently. For each missing program it first shows what it is, where it
+comes from and where it will go, then asks `[Y/n]`. If you answer **n**, nothing is installed and the
+launcher stops with a message. Installs use [winget](https://learn.microsoft.com/windows/package-manager/winget/),
+Windows' built-in package manager, which downloads each program from its official source.
+
+| Program | Why the bot needs it | Source and license | Where it goes | How to remove |
+|---|---|---|---|---|
+| **Python 3.13** (only if Python 3.11+ is missing) | Runs the bot | python.org, PSF-2.0 | Usually `%LOCALAPPDATA%\Programs\Python\Python313`, added to PATH | Settings → Apps → Python 3.13, or `winget uninstall --id Python.Python.3.13` |
+| **Node.js LTS** | yt-dlp uses it to read YouTube pages | nodejs.org, MIT | `C:\Program Files\nodejs`, added to PATH. Windows may ask for admin rights (UAC) | Settings → Apps → Node.js, or `winget uninstall --id OpenJS.NodeJS.LTS` |
+| **FFmpeg** | Turns YouTube audio into sound Discord can play | gyan.dev builds (linked from ffmpeg.org), GPL-3.0 | `%LOCALAPPDATA%\Microsoft\WinGet\Packages`, command added via `WinGet\Links`. No admin rights | `winget uninstall --id Gyan.FFmpeg` |
+
+winget itself may show the program's license or source agreement and ask you to accept it. That prompt comes
+from winget, not from the bot.
+
+**Python libraries** are installed without asking, but only inside the project's `.venv` folder (~70 MB):
+discord.py (with voice support), yt-dlp, python-dotenv and their dependencies. Nothing is installed
+system-wide; delete `.venv` to remove them. yt-dlp in `.venv` is updated on every start (see below).
+
+The launcher does **not** create services, scheduled tasks or autostart entries, and does not change any
+other system settings. The bot runs only while the `run.bat` window is open.
 
 ## Updating yt-dlp
 YouTube changes often, so yt-dlp must stay up to date. When the bot is started with `run.bat`, this is automatic:

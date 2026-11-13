@@ -52,17 +52,72 @@ function Update-SessionPath {
     $env:Path = "$machine;$user"
 }
 
-function Install-Package([string]$WingetId, [string]$Name, [string]$Url) {
+# What each program is, where it comes from and where it goes. Shown before asking to install it.
+$Packages = @{
+    python = @{
+        Id = 'Python.Python.3.13'; Name = 'Python 3.13'; Url = 'https://www.python.org/downloads/'
+        Lines = @(
+            @('Why:        runs the bot itself.',
+              'Защо:       на него работи самият бот.'),
+            @('From:       Python Software Foundation (python.org), license PSF-2.0.',
+              'Откъде:     Python Software Foundation (python.org), лиценз PSF-2.0.'),
+            @('Where:      usually %LOCALAPPDATA%\Programs\Python\Python313, added to PATH.',
+              'Къде:       обикновено %LOCALAPPDATA%\Programs\Python\Python313, добавя се в PATH.'),
+            @('Remove:     Settings -> Apps -> Python 3.13, or: winget uninstall --id Python.Python.3.13',
+              'Премахване: Settings -> Apps -> Python 3.13, или: winget uninstall --id Python.Python.3.13')
+        )
+    }
+    node = @{
+        Id = 'OpenJS.NodeJS.LTS'; Name = 'Node.js LTS'; Url = 'https://nodejs.org/'
+        Lines = @(
+            @('Why:        yt-dlp needs a JavaScript runtime to read YouTube pages.',
+              'Защо:       yt-dlp има нужда от JavaScript среда, за да чете страниците на YouTube.'),
+            @('From:       OpenJS Foundation (nodejs.org), license MIT.',
+              'Откъде:     OpenJS Foundation (nodejs.org), лиценз MIT.'),
+            @('Where:      C:\Program Files\nodejs, added to PATH. Windows may ask for admin rights (UAC).',
+              'Къде:       C:\Program Files\nodejs, добавя се в PATH. Windows може да поиска админ права (UAC).'),
+            @('Remove:     Settings -> Apps -> Node.js, or: winget uninstall --id OpenJS.NodeJS.LTS',
+              'Премахване: Settings -> Apps -> Node.js, или: winget uninstall --id OpenJS.NodeJS.LTS')
+        )
+    }
+    ffmpeg = @{
+        Id = 'Gyan.FFmpeg'; Name = 'FFmpeg'; Url = 'https://www.gyan.dev/ffmpeg/builds/'
+        Lines = @(
+            @('Why:        converts the YouTube audio into sound Discord can play.',
+              'Защо:       превръща аудиото от YouTube в звук, който Discord може да пусне.'),
+            @('From:       gyan.dev builds (linked from ffmpeg.org), license GPL-3.0.',
+              'Откъде:     компилациите на gyan.dev (с линк от ffmpeg.org), лиценз GPL-3.0.'),
+            @('Where:      %LOCALAPPDATA%\Microsoft\WinGet\Packages, command added via WinGet\Links. No admin rights.',
+              'Къде:       %LOCALAPPDATA%\Microsoft\WinGet\Packages, командата се добавя през WinGet\Links. Без админ права.'),
+            @('Remove:     winget uninstall --id Gyan.FFmpeg',
+              'Премахване: winget uninstall --id Gyan.FFmpeg')
+        )
+    }
+}
+
+function Show-Package([hashtable]$Package) {
+    Write-Host ''
+    Write-Host "   $($Package.Name)  (winget: $($Package.Id))" -ForegroundColor White
+    foreach ($pair in $Package.Lines) {
+        Write-Host "     $($pair[0])"
+        Write-Host "     $($pair[1])" -ForegroundColor DarkGray
+    }
+    Write-Host ''
+}
+
+function Install-Package([string]$Key) {
+    $p = $Packages[$Key]
     if (-not (Test-Command 'winget')) {
-        Write-Fail "winget is not available. Install $Name manually: $Url" `
-                   "winget липсва. Инсталирай $Name ръчно: $Url"
+        Write-Fail "winget is not available. Install $($p.Name) manually: $($p.Url)" `
+                   "winget липсва. Инсталирай $($p.Name) ръчно: $($p.Url)"
         return
     }
-    if (-not (Confirm-Action "Install $Name now with winget?" "Да инсталирам ли $Name сега с winget?")) {
+    Show-Package $p
+    if (-not (Confirm-Action "Install $($p.Name) now with winget?" "Да инсталирам ли $($p.Name) сега с winget?")) {
         return
     }
     # Start-Process keeps winget attached to this console so its own prompts (agreements, UAC) work.
-    Start-Process -FilePath 'winget' -ArgumentList @('install', '--id', $WingetId, '--exact') -NoNewWindow -Wait
+    Start-Process -FilePath 'winget' -ArgumentList @('install', '--id', $p.Id, '--exact') -NoNewWindow -Wait
     Update-SessionPath
 }
 
@@ -101,7 +156,7 @@ function Assert-Python {
     $python = Find-Python
     if (-not $python) {
         Write-Warn "Python $MinPython+ was not found." "Python $MinPython+ не е намерен."
-        Install-Package 'Python.Python.3.13' 'Python 3.13' 'https://www.python.org/downloads/'
+        Install-Package 'python'
         $python = Find-Python
     }
     if (-not $python) {
@@ -140,6 +195,10 @@ function Initialize-Venv([string]$Python) {
     if ($wanted -ne $have) {
         Write-Msg '   Installing libraries (first start or requirements.txt changed) ...' `
                   '   Инсталирам библиотеките (първо стартиране или променен requirements.txt) ...'
+        Write-Msg '   They go only into the .venv folder here (~70 MB): discord.py, yt-dlp, python-dotenv and their dependencies.' `
+                  '   Слагат се само в папката .venv тук (~70 MB): discord.py, yt-dlp, python-dotenv и техните зависимости.' 'DarkGray'
+        Write-Msg '   Nothing is installed system-wide. To remove them, delete the .venv folder.' `
+                  '   Нищо не се инсталира в системата. За да ги премахнеш, изтрий папката .venv.' 'DarkGray'
         & $VenvPy -m pip install --disable-pip-version-check -r $ReqFile
         if ($LASTEXITCODE -ne 0) {
             Write-Fail 'Installing the libraries failed. Check your internet connection and run again.' `
@@ -155,7 +214,7 @@ function Assert-Node {
     Write-Step 'Node.js (used by yt-dlp for YouTube)' 'Node.js (yt-dlp го ползва за YouTube)'
     if (-not (Test-Command 'node')) {
         Write-Warn 'Node.js was not found.' 'Node.js не е намерен.'
-        Install-Package 'OpenJS.NodeJS.LTS' 'Node.js LTS' 'https://nodejs.org/'
+        Install-Package 'node'
     }
     if (-not (Test-Command 'node')) {
         Write-Fail 'Node.js is required. Install it, reopen this window and try again.' `
@@ -181,7 +240,7 @@ function Assert-Ffmpeg {
             exit 1
         }
         Write-Warn 'FFmpeg was not found.' 'FFmpeg не е намерен.'
-        Install-Package 'Gyan.FFmpeg' 'FFmpeg' 'https://www.gyan.dev/ffmpeg/builds/'
+        Install-Package 'ffmpeg'
     }
     if (-not (Test-Ffmpeg)) {
         Write-Fail 'FFmpeg is required. Install it, reopen this window and try again.' `
@@ -215,6 +274,9 @@ function Assert-Config {
 # ---------- main ----------
 
 Write-Host 'IxMusicBot' -ForegroundColor Magenta
+Write-Msg 'This launcher checks Python, Node.js and FFmpeg. If one is missing, it explains what it is and asks before installing it.' `
+          'Този стартер проверява Python, Node.js и FFmpeg. Ако нещо липсва, обяснява какво е и пита преди да го инсталира.' 'DarkGray'
+Write-Msg 'Details: README.md -> "What gets installed".' 'Подробности: README.bg.md -> "Какво се инсталира".' 'DarkGray'
 Assert-Python
 Initialize-Venv $script:Python
 Assert-Node
