@@ -68,7 +68,12 @@ def main() -> None:
 
     discord.utils.setup_logging(level=logging.INFO)
     bot = IxMusicBot()
-    bot.run(config.DISCORD_TOKEN, log_handler=None)
+    try:
+        bot.run(config.DISCORD_TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        print("DISCORD_TOKEN is invalid. Copy a fresh token from Developer Portal -> Bot -> Reset Token.")
+        print("DISCORD_TOKEN е невалиден. Вземи нов токен от Developer Portal -> Bot -> Reset Token.")
+        sys.exit(1)
     sys.exit(bot.exit_code)
 
 

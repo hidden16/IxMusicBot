@@ -61,8 +61,15 @@ Set `LANGUAGE=en` or `LANGUAGE=bg` in `.env` to force one language.
 ### 1. Requirements
 - Python 3.11+
 - Node.js (used by yt-dlp to handle YouTube)
-- FFmpeg: `winget install Gyan.FFmpeg`, then restart the terminal.
-  If it is not in PATH, set the full path in `.env` → `FFMPEG_PATH`.
+- FFmpeg (plays the audio). If it is not in PATH, set the full path in `.env` → `FFMPEG_PATH`.
+
+You don't have to install them by hand: `run.bat` checks all three on every start and, if one is missing,
+offers to install it with `winget` (it asks before each install). Manual install:
+```
+winget install Python.Python.3.13
+winget install OpenJS.NodeJS.LTS
+winget install Gyan.FFmpeg
+```
 
 ### 2. Create a Discord application
 1. Go to https://discord.com/developers/applications → **New Application** → give it a name → **Create**.
@@ -84,7 +91,12 @@ Double-click `run.bat`, or:
 ```
 .venv\Scripts\python.exe bot.py
 ```
-On first start, a virtual environment is created and the dependencies are installed.
+`run.bat` (via `start.ps1`) does everything needed before starting the bot:
+1. checks Python, Node.js and FFmpeg and offers to install missing ones;
+2. creates the virtual environment (or recreates it if it is broken) and installs the libraries
+   on first start, after a failed install, or when `requirements.txt` changes;
+3. creates `.env` if it is missing and offers to open it in Notepad if the token is empty;
+4. updates yt-dlp and starts the bot.
 
 ### 5. Add the bot to your server
 On start, the bot prints an **invite link** with the required permissions to the console.
@@ -119,6 +131,8 @@ config.py        – reads .env
 i18n.py          – English / Bulgarian texts
 cogs/music.py    – queue, player and all music commands
 cogs/updater.py  – automatic yt-dlp update check
+run.bat          – double-click launcher
+start.ps1        – prerequisite checks, setup and restart loop
 ```
 
 ## License
