@@ -114,6 +114,8 @@ class Track:
     requester: str
     stream_url: str | None = None
     resolved_at: float = 0.0
+    # Unix time when YouTube starts serving the stream URL. Requests before then get 403.
+    available_at: float = 0.0
 
     @classmethod
     def from_info(cls, info: dict, requester: str) -> Track:
@@ -125,6 +127,7 @@ class Track:
             requester=requester,
             stream_url=info.get("url"),
             resolved_at=time.monotonic(),
+            available_at=info.get("available_at") or 0.0,
         )
 
     async def get_stream_url(self) -> str:
@@ -132,6 +135,11 @@ class Track:
             info = await extract(self.webpage_url)
             self.stream_url = info["url"]
             self.resolved_at = time.monotonic()
+            self.available_at = info.get("available_at") or 0.0
+        # YouTube rejects the URL (403) for a few seconds after issuing it; yt-dlp reports when it opens.
+        wait = self.available_at - time.time()
+        if wait > 0:
+            await asyncio.sleep(min(wait, 30))
         return self.stream_url
 
     @property
