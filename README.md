@@ -146,6 +146,37 @@ Turn it off with `AUTO_UPDATE=false` in `.env`. Manual update:
 .venv\Scripts\python.exe -m pip install -U "yt-dlp[default]"
 ```
 
+## Troubleshooting
+
+### `403 Forbidden (error code: 50001): Missing Access` on start
+The bot is not in the server set in `GUILD_ID`, so Discord refuses to register the slash commands.
+The bot stops before it prints the invite link, so invite it by hand with the link from
+[step 5](#5-add-the-bot-to-your-server), then start it again. Also check that `GUILD_ID` is a **server** ID
+(not a channel or user ID).
+
+### The bot joins and finds the song, but there is no sound and FFmpeg stops right away
+In the log: `ffmpeg process ... terminated with return code of 3436169992`. YouTube returns `403 Forbidden`
+for a freshly issued stream URL for a few seconds (yt-dlp reports when it opens as `available_at`).
+The bot now waits for that moment before starting FFmpeg, so music starts ~4 seconds after `/play`.
+If this comes back, update yt-dlp first (see [Updating yt-dlp](#updating-yt-dlp)).
+
+### The bot shows as speaking (green ring), but nobody hears anything
+Discord voice is end-to-end encrypted (DAVE). discord.py does this through the `davey` library, and
+**davey 0.2.x is incompatible with discord.py 2.7.x**: davey 0.2 only switches to the new keys after
+`prepare_transition` / `execute_transition`, which discord.py never calls. The DAVE session never becomes
+ready, the bot sends unencrypted audio, and every client drops it, with no error in the log.
+
+`requirements.txt` pins `davey<0.2`, and `run.bat` reinstalls the requirements when that file changes.
+To check or fix it by hand:
+```
+.venv\Scripts\python.exe -m pip show davey
+.venv\Scripts\python.exe -m pip install "davey>=0.1.0,<0.2"
+```
+Remove the pin only when a newer discord.py release supports davey 0.2.
+
+If only you can't hear the bot: right-click it in the voice channel and check **User Volume** and **Mute**,
+and that it is not **Server Muted**.
+
 ## Project structure
 ```
 bot.py           – startup, loads cogs, syncs slash commands
