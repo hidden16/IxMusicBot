@@ -7,7 +7,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import discord
 import yt_dlp
@@ -35,6 +35,17 @@ YTDL_OPTS = {
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 FFMPEG_OPTS = "-vn"
 STREAM_URL_MAX_AGE = 30 * 60  # googlevideo URLs expire; re-resolve after 30 min
+
+# Playlists / mixes: list the entries without resolving each video (fast); each one is resolved
+# right before it plays. Read at most this many entries, then keep what fits in the queue.
+PLAYLIST_OPTS = {
+    **{k: v for k, v in YTDL_OPTS.items() if k not in ("noplaylist", "playlist_items")},
+    "noplaylist": False,
+    "extract_flat": "in_playlist",
+    "playlistend": 500,
+}
+_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_UNAVAILABLE_TITLES = ("[Private video]", "[Deleted video]")
 
 ALLOWED_HOSTS = ("youtube.com", "youtu.be")
 _BARE_YT_URL = re.compile(r"^(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be)/", re.IGNORECASE)
@@ -74,6 +85,24 @@ def build_query(text: str) -> str:
     raise QueryError("only_youtube")
 
 
+def playlist_ids(url: str) -> tuple[str | None, str | None]:
+    """(playlist id, video id) of a YouTube link with a list= parameter, else (None, None).
+
+    Covers playlists, YouTube Mixes (list=RD...) and songs opened from one (watch?v=...&list=...).
+    """
+    if url.startswith("ytsearch"):
+        return None, None
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    list_id = (query.get("list") or [None])[0]
+    if not list_id:
+        return None, None
+    video_id = (query.get("v") or [None])[0]
+    if not video_id and (parsed.hostname or "").lower().endswith("youtu.be"):
+        video_id = parsed.path.strip("/") or None
+    return list_id, video_id
+
+
 def short_error(e: Exception, limit: int = 300) -> str:
     msg = str(e).replace("`", "'")
     return msg if len(msg) <= limit else msg[:limit] + "…"
@@ -95,6 +124,40 @@ def _extract(query: str) -> dict:
 async def extract(query: str) -> dict:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(_extract, query))
+
+
+def _extract_playlist(url: str, limit: int, start_video: str | None) -> tuple[str, list[dict], bool]:
+    """Return (title, playable entries, whether entries were cut to `limit`)."""
+    opts = dict(PLAYLIST_OPTS)
+    list_id, _ = playlist_ids(url)
+    # Mixes (RD...) start with the linked song and never end; a playlist without a start song
+    # starts at the top. Both only need `limit` entries (+ slack for hidden videos).
+    # Reading further is only worth it to find a start song in the middle of a normal playlist.
+    if not start_video or (list_id or "").startswith("RD"):
+        opts["playlistend"] = min(PLAYLIST_OPTS["playlistend"], limit + 10)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise LookupError("No results.")
+    entries = [
+        e
+        for e in (info.get("entries") or [])
+        if e and _VIDEO_ID.match(str(e.get("id") or "")) and e.get("title") not in _UNAVAILABLE_TITLES
+    ]
+    # A link like watch?v=X&list=... starts the playlist at X, as on YouTube.
+    if start_video:
+        for i, e in enumerate(entries):
+            if e["id"] == start_video:
+                entries = entries[i:]
+                break
+    if not entries:
+        raise LookupError("No results.")
+    return info.get("title") or "Playlist", entries[:limit], len(entries) > limit
+
+
+async def extract_playlist(url: str, limit: int, start_video: str | None) -> tuple[str, list[dict], bool]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(_extract_playlist, url, limit, start_video))
 
 
 def fmt_duration(seconds: int | None, locale: Locale = None) -> str:
@@ -128,6 +191,20 @@ class Track:
             stream_url=info.get("url"),
             resolved_at=time.monotonic(),
             available_at=info.get("available_at") or 0.0,
+        )
+
+    @classmethod
+    def from_entry(cls, entry: dict, requester: str) -> Track:
+        """A playlist entry: only listed, its stream URL is resolved when it starts playing."""
+        duration = entry.get("duration")
+        thumbnails = entry.get("thumbnails") or []
+        return cls(
+            title=entry.get("title") or "Untitled",
+            # Built from the ID so the link always points at YouTube.
+            webpage_url=f"https://www.youtube.com/watch?v={entry['id']}",
+            duration=int(duration) if duration else None,
+            thumbnail=thumbnails[-1].get("url") if thumbnails else None,
+            requester=requester,
         )
 
     async def get_stream_url(self) -> str:
@@ -344,8 +421,11 @@ class Music(commands.Cog):
     # ---------- commands ----------
 
     @app_commands.command(name="play", description=_("Play a song from YouTube / YouTube Music (link or search)"))
-    @app_commands.describe(query=_("Video link or search text"))
-    async def play(self, interaction: discord.Interaction, query: str) -> None:
+    @app_commands.describe(
+        query=_("Video link or search text"),
+        playlist=_("For playlist / mix links: load all songs (default) or only this one"),
+    )
+    async def play(self, interaction: discord.Interaction, query: str, playlist: bool = True) -> None:
         loc = interaction.locale
         try:
             search = build_query(query)
@@ -353,14 +433,18 @@ class Music(commands.Cog):
             await interaction.response.send_message(f"⚠️ {t(e.key, loc)}", ephemeral=True)
             return
 
-        player = self.players.get(interaction.guild_id)
-        if player is not None and len(player.queue) >= config.MAX_QUEUE:
+        if self._queue_room(interaction.guild_id) <= 0:
             await interaction.response.send_message(t("queue_full", loc, max=config.MAX_QUEUE), ephemeral=True)
             return
 
         await interaction.response.defer(thinking=True)
         vc = await self._connect(interaction)
         if vc is None:
+            return
+
+        list_id, video_id = playlist_ids(search)
+        if list_id and playlist:
+            await self._play_playlist(interaction, search, video_id)
             return
 
         try:
@@ -374,14 +458,10 @@ class Music(commands.Cog):
             return
 
         track = Track.from_info(info, requester=interaction.user.mention)
-        player = self.players.get(interaction.guild_id)
-        if player is not None and len(player.queue) >= config.MAX_QUEUE:
+        if self._queue_room(interaction.guild_id) <= 0:
             await interaction.followup.send(t("queue_full", loc, max=config.MAX_QUEUE))
             return
-        if player is None:
-            player = GuildPlayer(self, interaction.guild, interaction.channel, loc)
-            self.players[interaction.guild_id] = player
-        player.locale = loc
+        player = self._get_or_create_player(interaction)
 
         busy = player.current is not None or bool(player.queue)
         player.add(track)
@@ -391,6 +471,52 @@ class Music(commands.Cog):
             )
         else:
             await interaction.followup.send(t("loading", loc, link=track.link))
+
+    def _queue_room(self, guild_id: int | None) -> int:
+        player = self.players.get(guild_id)
+        return config.MAX_QUEUE - (len(player.queue) if player else 0)
+
+    def _get_or_create_player(self, interaction: discord.Interaction) -> GuildPlayer:
+        player = self.players.get(interaction.guild_id)
+        if player is None:
+            player = GuildPlayer(self, interaction.guild, interaction.channel, interaction.locale)
+            self.players[interaction.guild_id] = player
+        player.locale = interaction.locale
+        return player
+
+    async def _play_playlist(self, interaction: discord.Interaction, url: str, start_video: str | None) -> None:
+        loc = interaction.locale
+        try:
+            title, entries, cut = await extract_playlist(url, self._queue_room(interaction.guild_id), start_video)
+        except LookupError:
+            await interaction.followup.send(t("no_results", loc))
+            return
+        except Exception as e:  # noqa: BLE001
+            log.exception("Playlist extraction failed for %r", url)
+            await interaction.followup.send(t("not_found", loc, error=short_error(e)))
+            return
+
+        # The queue may have filled up while the playlist was loading.
+        room = self._queue_room(interaction.guild_id)
+        if room <= 0:
+            await interaction.followup.send(t("queue_full", loc, max=config.MAX_QUEUE))
+            return
+        if len(entries) > room:
+            entries, cut = entries[:room], True
+
+        player = self._get_or_create_player(interaction)
+        busy = player.current is not None or bool(player.queue)
+        tracks = [Track.from_entry(e, requester=interaction.user.mention) for e in entries]
+        for track in tracks:
+            player.add(track)
+
+        name = discord.utils.escape_markdown(title)
+        msg = t("playlist_added", loc, n=len(tracks), title=name)
+        if cut:
+            msg += " " + t("playlist_cut", loc, max=config.MAX_QUEUE)
+        if not busy:
+            msg += "\n" + t("loading", loc, link=tracks[0].link)
+        await interaction.followup.send(msg)
 
     @app_commands.command(name="pause", description=_("Pause playback"))
     async def pause(self, interaction: discord.Interaction) -> None:

@@ -20,7 +20,7 @@ Python + [discord.py](https://github.com/Rapptz/discord.py) + [yt-dlp](https://g
 
 | Command | What it does |
 |---|---|
-| `/play <link or search>` | Plays a song or adds it to the queue |
+| `/play <link or search>` | Plays a song or adds it to the queue. Playlist and mix links add all their songs (see below) |
 | `/pause`, `/resume` | Pause / resume |
 | `/skip` | Next song |
 | `/stop` | Stops and clears the queue |
@@ -31,6 +31,16 @@ Python + [discord.py](https://github.com/Rapptz/discord.py) + [yt-dlp](https://g
 | `/leave` | Leaves the voice channel |
 
 The bot leaves on its own after `IDLE_TIMEOUT` seconds without music, or when everyone leaves the channel.
+
+## Playlists and mixes
+When the `/play` link has a `list=` parameter, the bot adds all its songs to the queue:
+- a playlist: `youtube.com/playlist?list=...` (YouTube Music playlists too);
+- a YouTube Mix ("Mix – ..."): `list=RD...`;
+- a song opened from a playlist or mix: `watch?v=...&list=...`. The queue starts at that song, as on YouTube.
+
+Songs are added until the queue reaches `MAX_QUEUE`; the reply says so if the rest didn't fit. Private and deleted
+videos are skipped. The list loads in a few seconds because each song's audio is only fetched when its turn comes.
+To play just the one song from such a link: `/play <link> playlist:False`.
 
 ## Music channel
 Set `MUSIC_CHANNEL_ID` to keep the bot in one text channel. Music commands then work only there
@@ -51,7 +61,8 @@ Set `LANGUAGE=en` or `LANGUAGE=bg` in `.env` to force one language.
 
 ## Security
 - `/play` only accepts YouTube / YouTube Music links or search text. All other URLs are rejected.
-- The queue is limited to `MAX_QUEUE` songs (default 100). A playlist link only loads its first video.
+- The queue is limited to `MAX_QUEUE` songs (default 100), playlists and mixes included. Playlist songs
+  always link to `youtube.com/watch?v=<id>`, built from the video ID.
 - The bot never pings anyone (`@everyone`, roles, users).
 - Use `ALLOWED_USER_IDS` to limit who can use the bot.
 - Never give the bot **Administrator** permission. If the token leaks: Developer Portal → Bot → **Reset Token**.

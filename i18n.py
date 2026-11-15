@@ -47,6 +47,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "volume_set": "🔊 Volume: **{level}%**",
         "no_such_position": "There's no such number in the queue.",
         "removed": "🗑️ Removed: {link}",
+        "playlist_added": "📃 Added **{n}** songs from **{title}** to the queue.",
+        "playlist_cut": "(Stopped at the queue limit of {max} songs.)",
     },
     "bg": {
         "guild_only": "Командите работят само в сървър.",
@@ -83,6 +85,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "volume_set": "🔊 Сила на звука: **{level}%**",
         "no_such_position": "Няма такъв номер в опашката.",
         "removed": "🗑️ Премахнато: {link}",
+        "playlist_added": "📃 Добавих **{n}** песни от **{title}** в опашката.",
+        "playlist_cut": "(Спрях до лимита на опашката от {max} песни.)",
     },
 }
 
@@ -91,6 +95,7 @@ STRINGS: dict[str, dict[str, str]] = {
 COMMAND_DESCRIPTIONS_BG: dict[str, str] = {
     "Play a song from YouTube / YouTube Music (link or search)": "Пусни песен от YouTube / YouTube Music (линк или търсене)",
     "Video link or search text": "Линк към видео или текст за търсене",
+    "For playlist / mix links: load all songs (default) or only this one": "За линк към плейлист / микс: всички песни (по подразбиране) или само тази",
     "Pause playback": "Пауза",
     "Resume playback": "Продължи след пауза",
     "Skip to the next song": "Следваща песен",
