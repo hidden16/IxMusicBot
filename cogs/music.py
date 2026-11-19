@@ -31,7 +31,18 @@ YTDL_OPTS = {
     "allowed_extractors": ["youtube", "youtube:.*"],
     # YouTube needs a JS runtime for its signature challenges; Node is already installed.
     "js_runtimes": {"node": {}},
+    "socket_timeout": 15,
 }
+# A hung YouTube lookup must not leave the command "thinking" forever.
+EXTRACT_TIMEOUT = 90
+# Voice: discord.py waits for Discord's voice events this long per attempt. When they never come
+# (e.g. Discord still thinks the bot is in a channel after a crash), we reset the voice state and retry.
+CONNECT_TIMEOUT = 20
+CONNECT_ATTEMPTS = 2
+# A voice connection that drops is given this long to come back before the player gives up.
+RECONNECT_GRACE = 15
+# A song that ends this fast (and wasn't skipped) failed to stream, usually a 403; retry it once.
+EARLY_END_SECONDS = 5
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 FFMPEG_OPTS = "-vn"
 STREAM_URL_MAX_AGE = 30 * 60  # googlevideo URLs expire; re-resolve after 30 min
@@ -104,7 +115,7 @@ def playlist_ids(url: str) -> tuple[str | None, str | None]:
 
 
 def short_error(e: Exception, limit: int = 300) -> str:
-    msg = str(e).replace("`", "'")
+    msg = str(e).replace("`", "'") or type(e).__name__
     return msg if len(msg) <= limit else msg[:limit] + "…"
 
 
@@ -123,7 +134,9 @@ def _extract(query: str) -> dict:
 
 async def extract(query: str) -> dict:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, functools.partial(_extract, query))
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, functools.partial(_extract, query)), timeout=EXTRACT_TIMEOUT
+    )
 
 
 def _extract_playlist(url: str, limit: int, start_video: str | None) -> tuple[str, list[dict], bool]:
@@ -157,7 +170,20 @@ def _extract_playlist(url: str, limit: int, start_video: str | None) -> tuple[st
 
 async def extract_playlist(url: str, limit: int, start_video: str | None) -> tuple[str, list[dict], bool]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, functools.partial(_extract_playlist, url, limit, start_video))
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, functools.partial(_extract_playlist, url, limit, start_video)),
+        timeout=EXTRACT_TIMEOUT,
+    )
+
+
+async def wait_connected(vc: discord.VoiceClient, timeout: float) -> bool:
+    """Wait for a voice client that is (re)connecting. True once it is connected."""
+    deadline = time.monotonic() + timeout
+    while not vc.is_connected():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.5)
+    return True
 
 
 def fmt_duration(seconds: int | None, locale: Locale = None) -> str:
@@ -179,6 +205,7 @@ class Track:
     resolved_at: float = 0.0
     # Unix time when YouTube starts serving the stream URL. Requests before then get 403.
     available_at: float = 0.0
+    retried: bool = False
 
     @classmethod
     def from_info(cls, info: dict, requester: str) -> Track:
@@ -241,11 +268,18 @@ class GuildPlayer:
         self.volume = config.DEFAULT_VOLUME / 100
         self._wake = asyncio.Event()
         self._done = asyncio.Event()
+        self._stopped = False  # the current song was ended on purpose (/skip, /stop)
         self._task = asyncio.create_task(self._run())
 
     def add(self, track: Track) -> None:
         self.queue.append(track)
         self._wake.set()
+
+    def stop_current(self) -> None:
+        vc = self.guild.voice_client
+        if isinstance(vc, discord.VoiceClient):
+            self._stopped = True
+            vc.stop()  # triggers the after-callback -> next track
 
     def destroy(self) -> None:
         self._task.cancel()
@@ -270,7 +304,10 @@ class GuildPlayer:
                     continue
 
                 vc = self.guild.voice_client
-                if not isinstance(vc, discord.VoiceClient) or not vc.is_connected():
+                # The connection may be mid-reconnect (Discord moves voice servers now and then).
+                if not isinstance(vc, discord.VoiceClient) or not await wait_connected(vc, RECONNECT_GRACE):
+                    log.warning("Voice connection lost in guild %s; stopping the player", self.guild.id)
+                    await self.say(t("voice_lost", self.locale))
                     return
 
                 track = self.queue.popleft()
@@ -296,12 +333,41 @@ class GuildPlayer:
                         log.error("Player error: %s", error)
                     loop.call_soon_threadsafe(self._done.set)
 
+                # Resolving the stream can take a while; the connection may have changed meanwhile.
+                vc = self.guild.voice_client
+                if not isinstance(vc, discord.VoiceClient) or not vc.is_connected():
+                    source.cleanup()
+                    self.queue.appendleft(track)  # the loop above waits for the connection
+                    continue
+
                 self._done.clear()
+                self._stopped = False
                 self.current = track
-                vc.play(source, after=_after)
-                await self.say(embed=self.cog.now_playing_embed(self, self.locale))
+                try:
+                    vc.play(source, after=_after)
+                except discord.ClientException:
+                    log.warning("Could not start playback in guild %s", self.guild.id, exc_info=True)
+                    source.cleanup()
+                    self.current = None
+                    self.queue.appendleft(track)
+                    continue
+                started = time.monotonic()
+                if not track.retried:
+                    await self.say(embed=self.cog.now_playing_embed(self, self.locale))
                 await self._done.wait()
                 self.current = None
+
+                # FFmpeg exits almost at once when YouTube refuses the stream: get a fresh URL, try once more.
+                if (
+                    not self._stopped
+                    and not track.retried
+                    and time.monotonic() - started < EARLY_END_SECONDS
+                    and (track.duration or 0) > EARLY_END_SECONDS * 2
+                ):
+                    log.warning("%s ended right after starting; retrying with a fresh stream URL", track.webpage_url)
+                    track.retried = True
+                    track.stream_url = None
+                    self.queue.appendleft(track)
         except asyncio.CancelledError:
             pass
         finally:
@@ -320,6 +386,8 @@ class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.players: dict[int, GuildPlayer] = {}
+        # One voice connect at a time per server: two /play at once would otherwise race.
+        self._connect_locks: dict[int, asyncio.Lock] = {}
 
     async def cog_unload(self) -> None:
         for player in list(self.players.values()):
@@ -351,6 +419,16 @@ class Music(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
+        # After a crash or a closed window Discord can still show the bot in a voice channel.
+        # Joining again then hangs at "Starting voice handshake", so leave those channels first.
+        for guild in self.bot.guilds:
+            if guild.me and guild.me.voice and guild.voice_client is None:
+                log.info("Clearing leftover voice session in %s", guild.name)
+                try:
+                    await guild.change_voice_state(channel=None)
+                except Exception:  # noqa: BLE001
+                    log.warning("Could not clear the voice session in %s", guild.name, exc_info=True)
+
         if not config.MUSIC_CHANNEL_ID:
             return
         channel = self.bot.get_channel(config.MUSIC_CHANNEL_ID)
@@ -395,12 +473,40 @@ class Music(commands.Cog):
             await self._reply(interaction, t("join_voice_first", interaction.locale), ephemeral=True)
             return None
         channel = member.voice.channel
-        vc = interaction.guild.voice_client
-        if isinstance(vc, discord.VoiceClient) and vc.is_connected():
-            if vc.channel != channel:
-                await vc.move_to(channel)
-            return vc
-        return await channel.connect(self_deaf=True)
+        guild = interaction.guild
+        lock = self._connect_locks.setdefault(guild.id, asyncio.Lock())
+        async with lock:
+            vc = guild.voice_client
+            # A client that is reconnecting gets a moment before it is replaced.
+            if isinstance(vc, discord.VoiceClient) and await wait_connected(vc, 5):
+                if vc.channel != channel:
+                    await vc.move_to(channel)
+                return vc
+
+            for attempt in range(1, CONNECT_ATTEMPTS + 1):
+                stale = guild.voice_client
+                if stale is not None:
+                    # A half-open client blocks connect() with "Already connected to a voice channel".
+                    try:
+                        await stale.disconnect(force=True)
+                    except Exception:  # noqa: BLE001
+                        log.debug("Ignoring error while dropping a stale voice client", exc_info=True)
+                try:
+                    return await channel.connect(self_deaf=True, timeout=CONNECT_TIMEOUT)
+                except (asyncio.TimeoutError, discord.ClientException) as e:
+                    log.warning(
+                        "Voice connect to %s failed (attempt %d/%d): %s",
+                        channel.id, attempt, CONNECT_ATTEMPTS, short_error(e),
+                    )
+                    # Discord may still have the bot in voice from an old session; tell it the bot left.
+                    try:
+                        await guild.change_voice_state(channel=None)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await asyncio.sleep(2)
+
+        await self._reply(interaction, t("voice_connect_failed", interaction.locale))
+        return None
 
     def _player(self, interaction: discord.Interaction) -> GuildPlayer | None:
         return self.players.get(interaction.guild_id)
@@ -438,7 +544,12 @@ class Music(commands.Cog):
             return
 
         await interaction.response.defer(thinking=True)
-        vc = await self._connect(interaction)
+        try:
+            vc = await self._connect(interaction)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Joining voice failed")
+            await interaction.followup.send(t("command_error", loc, error=short_error(e)))
+            return
         if vc is None:
             return
 
@@ -539,8 +650,9 @@ class Music(commands.Cog):
     @app_commands.command(name="skip", description=_("Skip to the next song"))
     async def skip(self, interaction: discord.Interaction) -> None:
         vc = interaction.guild.voice_client
-        if isinstance(vc, discord.VoiceClient) and (vc.is_playing() or vc.is_paused()):
-            vc.stop()  # triggers the after-callback -> next track
+        player = self._player(interaction)
+        if player and isinstance(vc, discord.VoiceClient) and (vc.is_playing() or vc.is_paused()):
+            player.stop_current()
             await self._reply(interaction, t("skipped", interaction.locale))
         else:
             await self._reply(interaction, t("nothing_playing", interaction.locale), ephemeral=True)
@@ -551,9 +663,7 @@ class Music(commands.Cog):
         if player is None:
             return
         player.queue.clear()
-        vc = interaction.guild.voice_client
-        if isinstance(vc, discord.VoiceClient):
-            vc.stop()
+        player.stop_current()
         await self._reply(interaction, t("stopped", interaction.locale))
 
     @app_commands.command(name="leave", description=_("Leave the voice channel"))

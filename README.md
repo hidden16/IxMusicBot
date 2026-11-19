@@ -107,7 +107,10 @@ Double-click `run.bat`, or:
 2. creates the virtual environment (or recreates it if it is broken) and installs the libraries
    on first start, after a failed install, or when `requirements.txt` changes;
 3. creates `.env` if it is missing and offers to open it in Notepad if the token is empty;
-4. updates yt-dlp and starts the bot.
+4. updates all libraries, checks them (see [Updates](#updates)) and starts the bot;
+5. starts the bot again if it crashes (after 10 s, then longer after each crash in a row, up to 5 min).
+
+Only one copy runs per folder: starting a second `run.bat` says the bot is already running.
 
 ### 5. Add the bot to your server
 On start, the bot prints an **invite link** with the required permissions to the console.
@@ -145,14 +148,27 @@ system-wide; delete `.venv` to remove them. yt-dlp in `.venv` is updated on ever
 The launcher does **not** create services, scheduled tasks or autostart entries, and does not change any
 other system settings. The bot runs only while the `run.bat` window is open.
 
-## Updating yt-dlp
-YouTube changes often, so yt-dlp must stay up to date. When the bot is started with `run.bat`, this is automatic:
-- on every start, `run.bat` updates yt-dlp first;
-- every `UPDATE_CHECK_HOURS` hours (default 24), the bot checks PyPI for a new version. If there is one,
+## Updates
+YouTube and Discord change often, so the libraries must stay up to date. When the bot is started with
+`run.bat`, this is automatic:
+- on every start, `run.bat` updates **all** libraries (discord.py, davey, yt-dlp, python-dotenv and their
+  dependencies) to the newest versions `requirements.txt` allows. Its upper limits keep each one on its
+  current major version, and keep `davey` below 0.2 (see Troubleshooting);
+- every `UPDATE_CHECK_HOURS` hours (default 24), the bot checks PyPI for a new yt-dlp. If there is one,
   it waits until no music is playing anywhere, restarts, and `run.bat` installs it.
 
-Only yt-dlp is updated. Other libraries stay on their versions so nothing breaks unexpectedly.
-Turn it off with `AUTO_UPDATE=false` in `.env`. Manual update:
+So that an update can't take the bot down:
+- after updating, `run.bat` checks that the versions fit together, stay within `requirements.txt`, and
+  that voice support (PyNaCl, davey) loads;
+- once the bot has run for 2 minutes, its versions are saved as the last working set
+  (`.venv\known-good.txt`);
+- if the check fails, or the bot crashes within 2 minutes of an update, `run.bat` goes back to that
+  set and stops updating until you start `run.bat` again.
+
+This catches updates that crash the bot or break its libraries. It can't catch an update that keeps
+the bot running but plays badly (for example silent audio). If that happens, tell the project.
+
+Turn updates off with `AUTO_UPDATE=false` in `.env`. Manual update:
 ```
 .venv\Scripts\python.exe -m pip install -U "yt-dlp[default]"
 ```

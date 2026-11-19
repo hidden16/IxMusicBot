@@ -2,10 +2,11 @@ import logging
 import sys
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 import config
-from i18n import BotTranslator
+from i18n import BotTranslator, t
 
 log = logging.getLogger("ixmusic")
 
@@ -29,7 +30,27 @@ class IxMusicBot(commands.Bot):
         )
         self.exit_code = 0
 
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """Always answer a failed command, so it never stays on "<bot> is thinking..."."""
+        if isinstance(error, app_commands.CheckFailure):
+            return  # interaction_check already replied
+        name = interaction.command.name if interaction.command else "?"
+        log.error("Command /%s failed", name, exc_info=error)
+        original = getattr(error, "original", error)
+        detail = (str(original) or type(original).__name__).replace("`", "'")[:300]
+        msg = t("command_error", interaction.locale, error=detail)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     async def setup_hook(self) -> None:
+        self.tree.on_error = self.on_app_command_error
         await self.tree.set_translator(BotTranslator())
         await self.load_extension("cogs.music")
         if config.AUTO_UPDATE:
@@ -60,19 +81,34 @@ class IxMusicBot(commands.Bot):
         )
 
 
-def main() -> None:
-    if not config.DISCORD_TOKEN:
-        print("DISCORD_TOKEN is missing. Copy .env.example to .env and fill it in.")
-        print("Липсва DISCORD_TOKEN. Копирай .env.example като .env и го попълни.")
-        sys.exit(1)
+# start.ps1 restarts the bot after a crash, but not after this code: a bad .env won't fix itself.
+CONFIG_ERROR_EXIT_CODE = 2
 
+
+def config_error(en: str, bg: str) -> None:
+    log.error(en)
+    log.error(bg)
+    sys.exit(CONFIG_ERROR_EXIT_CODE)
+
+
+def main() -> None:
     discord.utils.setup_logging(level=logging.INFO)
+    if not config.DISCORD_TOKEN:
+        config_error(
+            "DISCORD_TOKEN is missing. Copy .env.example to .env and fill it in.",
+            "Липсва DISCORD_TOKEN. Копирай .env.example като .env и го попълни.",
+        )
+
     bot = IxMusicBot()
     try:
         bot.run(config.DISCORD_TOKEN, log_handler=None)
     except discord.LoginFailure:
-        print("DISCORD_TOKEN is invalid. Copy a fresh token from Developer Portal -> Bot -> Reset Token.")
-        print("DISCORD_TOKEN е невалиден. Вземи нов токен от Developer Portal -> Bot -> Reset Token.")
+        config_error(
+            "DISCORD_TOKEN is invalid. Copy a fresh token from Developer Portal -> Bot -> Reset Token.",
+            "DISCORD_TOKEN е невалиден. Вземи нов токен от Developer Portal -> Bot -> Reset Token.",
+        )
+    except Exception:
+        log.exception("The bot crashed")
         sys.exit(1)
     sys.exit(bot.exit_code)
 

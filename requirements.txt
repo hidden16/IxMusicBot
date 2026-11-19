@@ -1,6 +1,8 @@
-discord.py[voice]>=2.6
+# start.ps1 updates everything to the newest version these limits allow on every start.
+# Upper limits keep it on the same major version, where updates should not break the bot.
+discord.py[voice]>=2.6,<3
 # davey 0.2 requires explicit prepare/execute_transition calls that discord.py 2.7.x never makes,
 # so the DAVE session never becomes ready and the bot sends audio no client can play.
 davey>=0.1.0,<0.2
 yt-dlp[default]>=2025.11.12
-python-dotenv>=1.0
+python-dotenv>=1.0,<2

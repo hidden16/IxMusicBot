@@ -4,7 +4,11 @@
     1. Checks Python, Node.js and FFmpeg and offers to install missing ones with winget (asks first).
     2. Creates / repairs the virtual environment and installs requirements when they change.
     3. Makes sure .env exists and has a token.
-    4. Runs the bot, updating yt-dlp before every start, and restarts it when it asks to (exit code 3).
+    4. Before every start, updates all libraries (within the versions requirements.txt allows) and checks
+       them. If an update breaks them, or the bot crashes right after one, it goes back to the last set
+       of versions that worked (.venv\known-good.txt) and skips updating until the next launch.
+    5. Runs the bot and restarts it when it asks to (exit code 3) or when it crashes
+       (waiting longer after each crash in a row).
 #>
 
 $ErrorActionPreference = 'Continue'
@@ -18,6 +22,9 @@ $EnvFile   = Join-Path $PSScriptRoot '.env'
 $EnvSample = Join-Path $PSScriptRoot '.env.example'
 $MinPython = [version]'3.11'
 $RestartExitCode = 3
+$ConfigErrorExitCode = 2   # bad / missing token: restarting would not help
+$KnownGood = Join-Path $VenvDir 'known-good.txt'  # pip freeze of the last versions that ran fine
+$HealthySeconds = 120      # a bot that ran this long counts as working with its current libraries
 
 # ---------- output helpers ----------
 
@@ -271,7 +278,117 @@ function Assert-Config {
     Write-Ok '.env'
 }
 
+# ---------- updates ----------
+
+$script:HoldUpdates = $false
+
+function Get-Freeze {
+    return @(& $VenvPy -m pip freeze --disable-pip-version-check 2>$null)
+}
+
+function Test-Libraries {
+    # 1. dependencies are consistent; 2. every installed version is inside the limits in requirements.txt
+    #    (e.g. davey<0.2, without which audio goes silent); 3. voice support (PyNaCl, davey/DAVE) loads.
+    & $VenvPy -m pip check --disable-pip-version-check 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    # No double quotes in this code: Windows PowerShell 5.1 mangles them in native arguments.
+    $problems = & $VenvPy -c @'
+import sys
+from importlib.metadata import PackageNotFoundError, version
+try:
+    from packaging.requirements import Requirement
+except ImportError:
+    from pip._vendor.packaging.requirements import Requirement
+bad = []
+for line in open(sys.argv[1], encoding='utf-8'):
+    line = line.split('#', 1)[0].strip()
+    if not line:
+        continue
+    req = Requirement(line)
+    try:
+        have = version(req.name)
+    except PackageNotFoundError:
+        bad.append(req.name + ' is missing')
+        continue
+    if not req.specifier.contains(have, prereleases=True):
+        bad.append(req.name + ' ' + have + ' is outside ' + str(req.specifier))
+try:
+    import aiohttp, dotenv, yt_dlp
+    from discord.voice_client import has_nacl
+    from discord.voice_state import has_dave
+    if not (has_nacl and has_dave):
+        bad.append('voice support does not load (PyNaCl / davey)')
+except Exception as e:
+    bad.append('import failed: ' + repr(e))
+print('\n'.join(bad))
+raise SystemExit(1 if bad else 0)
+'@ $ReqFile 2>$null
+    $ok = ($LASTEXITCODE -eq 0)
+    foreach ($p in @($problems | Where-Object { $_ })) { Write-Host "       $p" -ForegroundColor Yellow }
+    return $ok
+}
+
+function Save-KnownGood {
+    $freeze = Get-Freeze
+    if ($freeze.Count -gt 0) { Set-Content -LiteralPath $KnownGood -Value $freeze -Encoding ASCII }
+}
+
+function Restore-KnownGood {
+    Write-Msg '   Restoring the last working versions (.venv\known-good.txt) ...' `
+              '   Връщам последните работещи версии (.venv\known-good.txt) ...'
+    & $VenvPy -m pip install -q --disable-pip-version-check -r $KnownGood
+    $ok = ($LASTEXITCODE -eq 0) -and (Test-Libraries)
+    if ($ok) {
+        Write-Ok 'restored / върнати'
+        # Don't install the same broken versions again on the next restart of this launch.
+        $script:HoldUpdates = $true
+        $env:IXMUSIC_HOLD_UPDATES = '1'
+    } else {
+        Write-Fail 'Could not restore the previous versions.' 'Не успях да върна предишните версии.'
+    }
+    return $ok
+}
+
+function Update-Libraries {
+    # Updates everything in requirements.txt as far as its version limits allow.
+    # Returns $true when something changed.
+    Write-Step 'Updating libraries' 'Обновявам библиотеките'
+    $before = Get-Freeze
+    & $VenvPy -m pip install -q --disable-pip-version-check -U -r $ReqFile
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn 'Update failed (no internet?) - starting with the installed versions.' `
+                   'Обновяването се провали (няма интернет?) - стартирам с инсталираните версии.'
+    }
+    $changed = @(Get-Freeze | Where-Object { $before -notcontains $_ })
+    if ($changed.Count -eq 0) {
+        Write-Ok 'everything is up to date / всичко е актуално'
+    } else {
+        foreach ($line in $changed) { Write-Ok "updated / обновено: $line" }
+    }
+
+    if (Test-Libraries) { return ($changed.Count -gt 0) }
+
+    Write-Warn 'The libraries fail the check (dependency conflict or voice support missing).' `
+               'Библиотеките не минават проверката (конфликт на версии или липсва поддръжка на глас).'
+    if ((Test-Path -LiteralPath $KnownGood) -and (Restore-KnownGood)) { return $false }
+    Write-Fail 'Delete the .venv folder and run run.bat again to reinstall everything.' `
+               'Изтрий папката .venv и пусни run.bat отново, за да се преинсталира всичко.'
+    exit 1
+}
+
 # ---------- main ----------
+
+# Only one copy per folder: two bots on one token would both answer every command.
+$mutexName = 'Local\IxMusicBot-' + ((Get-FileHash -InputStream ([IO.MemoryStream]::new(
+    [Text.Encoding]::UTF8.GetBytes($PSScriptRoot.ToLowerInvariant()))) -Algorithm SHA256).Hash.Substring(0, 16))
+$script:Mutex = New-Object System.Threading.Mutex($false, $mutexName)
+$owned = $false
+try { $owned = $script:Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+if (-not $owned) {
+    Write-Fail 'IxMusicBot is already running in another window. Close that one first.' `
+               'IxMusicBot вече работи в друг прозорец. Първо затвори него.'
+    exit 1
+}
 
 Write-Host 'IxMusicBot' -ForegroundColor Magenta
 Write-Msg 'This launcher checks Python, Node.js and FFmpeg. If one is missing, it explains what it is and asks before installing it.' `
@@ -284,21 +401,50 @@ Assert-Ffmpeg
 Assert-Config
 
 $env:IXMUSIC_LAUNCHER = '1'  # lets the bot restart itself to apply yt-dlp updates
+$crashes = 0
 while ($true) {
-    Write-Step 'Updating yt-dlp' 'Обновявам yt-dlp'
-    & $VenvPy -m pip install -q --disable-pip-version-check -U 'yt-dlp[default]'
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn 'yt-dlp update failed - starting with the installed version.' `
-                   'Обновяването на yt-dlp се провали - стартирам с инсталираната версия.'
+    $updated = $false
+    if ((Get-EnvValue 'AUTO_UPDATE') -in @('0', 'false', 'no', 'off')) {
+        Write-Step 'Updates are off (AUTO_UPDATE=false in .env)' 'Обновяването е изключено (AUTO_UPDATE=false в .env)'
+    } elseif ($script:HoldUpdates) {
+        Write-Step 'Updates paused (the last one was rolled back) until run.bat is started again' `
+                   'Обновленията са спрени (последното беше върнато) до следващото пускане на run.bat'
+    } else {
+        $updated = Update-Libraries
     }
 
     Write-Step 'Starting the bot (Ctrl+C to stop)' 'Стартирам бота (Ctrl+C за спиране)'
-    & $VenvPy (Join-Path $PSScriptRoot 'bot.py')
-    $code = $LASTEXITCODE
+    $startedAt = Get-Date
+    $proc = Start-Process -FilePath $VenvPy -ArgumentList "`"$(Join-Path $PSScriptRoot 'bot.py')`"" `
+                          -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru
+    $null = $proc.Handle  # needed for ExitCode to be filled in later
+    $ranLong = -not $proc.WaitForExit($HealthySeconds * 1000)
+    if ($ranLong) {
+        Save-KnownGood  # these versions work: the fallback for the next broken update
+        $proc.WaitForExit()
+    }
+    $code = $proc.ExitCode
     if ($code -eq $RestartExitCode) {
         Write-Msg 'Restarting to apply the yt-dlp update...' 'Рестартирам, за да приложа обновлението на yt-dlp...' 'Cyan'
         continue
     }
-    Write-Msg "Bot stopped (exit code $code)." "Ботът спря (код $code)." 'Cyan'
-    exit $code
+    if ($code -eq 0 -or $code -eq $ConfigErrorExitCode) {
+        Write-Msg "Bot stopped (exit code $code)." "Ботът спря (код $code)." 'Cyan'
+        exit $code
+    }
+
+    # Crashed right after an update: the update is the likely cause, so go back to what worked.
+    if ($updated -and -not $ranLong -and (Test-Path -LiteralPath $KnownGood)) {
+        Write-Warn "Bot crashed (exit code $code) right after an update - going back to the last working versions." `
+                   "Ботът гръмна (код $code) веднага след обновяване - връщам последните работещи версии."
+        if (Restore-KnownGood) { continue }
+    }
+
+    # A crash: start again. A bot that ran for a while starts over at the shortest wait.
+    if (((Get-Date) - $startedAt).TotalMinutes -ge 10) { $crashes = 0 }
+    $crashes++
+    $wait = [Math]::Min(300, 10 * [Math]::Pow(2, $crashes - 1))
+    Write-Warn "Bot crashed (exit code $code). Starting again in $wait s... (Ctrl+C to stop)" `
+               "Ботът гръмна (код $code). Пускам го пак след $wait с... (Ctrl+C за спиране)"
+    Start-Sleep -Seconds $wait
 }

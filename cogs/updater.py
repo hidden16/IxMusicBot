@@ -58,6 +58,10 @@ class Updater(commands.Cog):
         if not os.getenv("IXMUSIC_LAUNCHER"):
             log.warning("Start the bot with run.bat to install updates automatically.")
             return
+        if os.getenv("IXMUSIC_HOLD_UPDATES"):
+            # start.ps1 rolled back a broken update; restarting now would only loop.
+            log.warning("Updates are paused until run.bat is started again (the last update was rolled back).")
+            return
 
         self.pending_version = latest
         self.check.stop()
